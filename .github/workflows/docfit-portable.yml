@@ -1,0 +1,164 @@
+# HWP AutoDocFit 사진첩용 NeeView 휴대용 zip 빌드 (포크 전용, 빌드 설정만 추가 — 앱 코드는 원본 그대로)
+#
+# - windows-latest + .NET 10 SDK로 원본의 MakePackage/MakePackage.ps1 -Target Zip 을 그대로 실행한다.
+#   (자체 포함 x64 zip과 .NET 런타임 의존(fd) zip 두 가지가 나온다)
+# - 결과 zip에 라이선스 파일(LICENSE.md, THIRDPARTY_LICENSES.md 등)과 소스 위치 안내(SOURCE.txt)를 넣고
+#   SHA256SUMS.txt를 만들어 아티팩트로 올린다.
+# - 수동 실행에서 release=true를 고르면 같은 파일을 GitHub 릴리스(docfit-v<버전>)로 게시한다.
+# - 7-Zip(7z.dll)·SevenZipSharp는 LGPL이라 별도 DLL 그대로 두며 정적 결합하지 않는다.
+# - 외부 액션은 커밋 SHA로 고정한다.
+name: DocFit portable build
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/docfit-portable.yml"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "GitHub 릴리스로 게시"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docfit-portable-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PANDOC_VERSION: "3.6.4"
+  PANDOC_SHA256: "a9e5feb3d56d2fb0e3e765d1c33b8ee6b72e6963d7de31504edeec8cd1be34b1"
+  NBEAUTY_VERSION: "2.1.5.1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - name: Checkout (서브모듈·전체 이력 — 빌드 번호가 커밋 수라서 필요)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install pandoc (README.html 생성용, 해시 확인)
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "pandoc.zip"
+          Invoke-WebRequest "https://github.com/jgm/pandoc/releases/download/$env:PANDOC_VERSION/pandoc-$env:PANDOC_VERSION-windows-x86_64.zip" -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:PANDOC_SHA256) { throw "pandoc SHA256 mismatch: $hash" }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          "$env:RUNNER_TEMP\pandoc-$env:PANDOC_VERSION" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install NetBeauty2 (nbeauty2)
+        shell: pwsh
+        run: |
+          dotnet tool install --global nulastudio.nbeauty --version $env:NBEAUTY_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "nbeauty install failed" }
+
+      - name: MakePackage -Target Zip (원본 스크립트 재사용)
+        shell: pwsh
+        working-directory: MakePackage
+        run: |
+          # 스크립트 첫머리의 Read-Host("Press Enter")에 빈 줄을 넣어 준다. -continue: 마지막 Export-Current 생략.
+          "" | pwsh -NoProfile -File .\MakePackage.ps1 -Target Zip -continue
+          if ($LASTEXITCODE -ne 0) { throw "MakePackage failed ($LASTEXITCODE)" }
+          Get-ChildItem *.zip | Format-Table Name, Length
+
+      - name: Add licenses and checksums
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $xml = [xml](Get-Content _Version.props)
+          $version = [string]$xml.Project.PropertyGroup.VersionPrefix
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "bad version: $version" }
+          $out = Join-Path $env:GITHUB_WORKSPACE "docfit-dist"
+          New-Item $out -ItemType Directory -Force | Out-Null
+          $commit = (git rev-parse HEAD).Trim()
+          $source = @(
+            "NeeView $version (HWP AutoDocFit 사진첩용 빌드)",
+            "",
+            "Source (fork): https://github.com/${{ github.repository }}/tree/$commit",
+            "Upstream:      https://github.com/neelabo/NeeView",
+            "Build:         https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "",
+            "NeeView is MIT licensed (LICENSE.md). Third-party components are listed in THIRDPARTY_LICENSES*.md.",
+            "7-Zip (7z.dll) and SevenZipSharp are LGPL and are shipped as separate, replaceable DLLs.",
+            "Their source code is available from the URLs above and in THIRDPARTY_LICENSES.md."
+          )
+          $zips = Get-ChildItem MakePackage -Filter "NeeView*.zip"
+          if ($zips.Count -eq 0) { throw "no zip produced" }
+          foreach ($zip in $zips) {
+            $flavor = if ($zip.BaseName -like "*-fd") { "x64-fd" } else { "x64" }
+            $work = Join-Path $env:RUNNER_TEMP "pkg-$flavor"
+            Expand-Archive $zip.FullName -DestinationPath $work -Force
+            $root = Get-ChildItem $work -Directory | Select-Object -First 1
+            if (-not (Test-Path (Join-Path $root.FullName "NeeView.exe"))) { throw "NeeView.exe missing in $($zip.Name)" }
+            Copy-Item -Path LICENSE.md, THIRDPARTY_LICENSES.md -Destination $root.FullName -Force
+            Copy-Item "NeeLaboratory.IO.Search\THIRDPARTY_LICENSES.md" (Join-Path $root.FullName "THIRDPARTY_LICENSES.NeeLaboratory.IO.Search.md") -Force
+            $source | Out-File (Join-Path $root.FullName "SOURCE.txt") -Encoding utf8
+            # 압축 안 최상위 폴더 이름을 NeeView로 통일(앱은 tools\NeeView\NeeView.exe를 찾는다).
+            $named = Join-Path $work "NeeView"
+            if ($root.FullName -ne $named) { Rename-Item $root.FullName "NeeView" }
+            $dest = Join-Path $out "NeeView-$version-docfit-$flavor.zip"
+            Compress-Archive -Path $named -DestinationPath $dest -CompressionLevel Optimal
+          }
+          Push-Location $out
+          Get-ChildItem *.zip | ForEach-Object {
+            "{0} *{1}" -f (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Out-File SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+          Pop-Location
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: neeview-docfit-portable
+          path: docfit-dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: neeview-docfit-portable
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          tag="docfit-v${VERSION}"
+          gh release create "$tag" dist/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "NeeView ${VERSION} (HWP AutoDocFit 사진첩용)" \
+            --notes "원본 NeeView(MIT)를 그대로 빌드한 휴대용 zip입니다. x64 = 자체 포함(.NET 설치 불필요), x64-fd = .NET 10 데스크톱 런타임 필요. 라이선스는 zip 안 LICENSE.md·THIRDPARTY_LICENSES*.md, 소스 위치는 SOURCE.txt. 빌드: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
